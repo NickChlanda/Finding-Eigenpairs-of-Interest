@@ -382,7 +382,7 @@ reconstruct_dos (const std::vector<double> &filtered_moments, int num_points, do
       rho[i] = p_i;
       sum_p += p_i;
     }
-  std::cout << "Sum of all p_i values: " << sum_p << std::endl;
+  
 }
 
 /* -----------------------------------------------------------------------------
@@ -534,13 +534,15 @@ chebyshev_filter_pass (std::vector<VecPtr> &X, std::shared_ptr<gko::LinOp> scale
 
   for (int k = 0; k < NSloc; ++k)
     {
+
+      //if you would like to follow proggress, uncomment these
       if (k == 0 || k == NSloc - 1)
         {
-          std::cout << "----------------------" << std::endl;
+          //std::cout << "----------------------" << std::endl;
         }
       if (k % 50 == 0)
         {
-          std::cout << " we are on vector " << k << "/" << NSloc << std::endl;
+          //std::cout << " progress: " << k << "/" << NSloc << std::endl;
         }
 
       // t1 = T1(A~) X[k] = A~ X[k]
@@ -616,7 +618,7 @@ svqb (std::vector<VecPtr> &X, gko::size_type N, std::shared_ptr<gko::Executor> e
 {
   const int nrows = static_cast<int> (N);
   const int r_blk = static_cast<int> (X.size ());
-  print_mem ("start of svqb ", gpuID);
+  
   auto W_real = real_vec::create (this_exec, gko::dim<2>{ nrows, r_blk });
 
   // Fill W from device vectors X[k]
@@ -708,7 +710,7 @@ svqb (std::vector<VecPtr> &X, gko::size_type N, std::shared_ptr<gko::Executor> e
       X_new[k] = gko::share (gko::clone (exec, col_h)); // host -> device
     }
   X = std::move (X_new);
-  print_mem ("after svqb", gpuID);
+ 
   return r;
 }
 
@@ -730,7 +732,7 @@ rayleigh_ritz (const std::vector<VecPtr> &X, std::shared_ptr<mtx> A, gko::size_t
   RitzResult R;
   const int r = (int) X.size ();
   const gko::size_type nloc = N;
-  print_mem ("begin RR", gpuID);
+  
 
   auto Y = gko::share (vec::create (exec, gko::dim<2>{ nloc, r })); // pack X columns into dense matrix Y
   for (int j = 0; j < r; ++j)
@@ -804,7 +806,7 @@ rayleigh_ritz (const std::vector<VecPtr> &X, std::shared_ptr<mtx> A, gko::size_t
     }
 
   R.lam.assign (theta.begin (), theta.end ());
-  print_mem ("end of RR", gpuID);
+  
   return R;
 }
 
@@ -890,11 +892,8 @@ main (int argc, char *argv[])
   const real_precision min_eig = static_cast<real_precision> (L.lam_min_lower);
   const real_precision max_eig = static_cast<real_precision> (L.lam_max_upper);
 
-  std::cout << "Lanczos bounds (k=" << k_lanczos << "):\n"
-            << "  mu_min=" << L.mu_min << "  mu_max=" << L.mu_max
-            << "  beta_{k+1}=" << L.beta_k1 << "\n"
-            << "  Lower bound for lambda_min(A): " << L.lam_min_lower << "\n"
-            << "  Upper bound for lambda_max(A): " << L.lam_max_upper << "\n";
+
+  std:: cout << "  Lower bound: " << L.lam_min_lower << "\n"<< "  Upper bound: " << L.lam_max_upper << "\n";
 
   // input min and max, epsilon defines the shift to get the scale to be -1,1
   const real_precision epsilon = 1e-2;
@@ -915,7 +914,7 @@ main (int argc, char *argv[])
 
   // === Step 2: Chebyshev Moments ===
   const int num_moments = 100;
-  std::cout << "num_moments = " << num_moments << std::endl;
+  
   const int num_random_vecs = 1;
 
   std::vector<double> moments = compute_chebyshev_moments (scaled_matrix, N, num_moments, num_random_vecs, exec, this_exec);
@@ -925,7 +924,7 @@ main (int argc, char *argv[])
 
   // === Step 5: Spectral Density Reconstruction ===
   const int num_points = 0.3 * N;
-  std::cout << "number of points " << num_points << std::endl;
+  
 
   std::vector<double> energies, rho;
   reconstruct_dos (filtered_moments, num_points, a, b, energies, rho);
@@ -936,16 +935,14 @@ main (int argc, char *argv[])
     rho_out << energies[i] << " " << rho[i] << "\n";
   rho_out.close ();
 
-  std::cout << "----------------------------------" << std::endl;
+
   std::cout << "Wrote spectral density to spectrum.txt\n";
 
   /*
      Chebyshev Filter Diagonalization starts here
   */
 
-  std::cout << "----------------------------------" << std::endl;
-  std::cout << "Starting Adaptive Window" << std::endl;
-  std::cout << "----------------------------------" << std::endl;
+
 
   // Energy grid from KPM, rho already defined
   std::vector<double> E_scaled = energies;
@@ -1037,6 +1034,8 @@ if (random_num >= interpolated_rho)
       // Center the window on z_new
       E_center = z_new;
 
+      std::cout << "random selected energy: "<< z_new << std::endl;
+
       // Bisection to find half-width giving target_eigs eigenvalues
       double win_half_width = bisect_half_width (E_scaled, rho, E_center, target_eigs, full_lo, full_hi, I_full, N, 50);
 
@@ -1066,8 +1065,10 @@ if (random_num >= interpolated_rho)
       double p = mean_rho_window / max_rho;
       int n_accept = std::max ((int) (p * NT), 20);
 
-      std::cout << "Adapted Window: [" << lower_use << ", " << upper_use << "]\n"
-                << "NT=" << NT << "  NS=" << NS << "  NP=" << NP << std::endl;
+    std::cout << "Window: [" << lower_use << ", " << upper_use << "]"<< std::endl;
+    std::cout << "window is set to contain this many eigenvalues =" << NT << std::endl;
+    std::cout <<  "creating this many search vectors =" << NS << std::endl;
+    std::cout <<"polynomial degree =" << NP << std::endl;
 
       min_lower_use = std::min (min_lower_use, lower_use);
       max_upper_use = std::max (max_upper_use, upper_use);
@@ -1077,7 +1078,7 @@ if (random_num >= interpolated_rho)
       search_vectors.reserve (NS);
       std::normal_distribution<double> normal (0.0, 1.0);
 
-      print_mem ("before making search vectors", gpuID);
+      
 
       for (int k = 0; k < NS; ++k)
         {
@@ -1096,7 +1097,7 @@ if (random_num >= interpolated_rho)
           search_vectors.push_back (gko::share (clone (exec, work)));
         }
 
-      print_mem ("after making search vectors", gpuID);
+     
 
       // Window coefficients (Lanczos kernel * step function on [lower_use, upper_use])
       std::vector<double> w = build_window_coefficients (lower_use, upper_use, alpha, beta, NP);
@@ -1113,9 +1114,9 @@ if (random_num >= interpolated_rho)
         {
           all_accepted.clear ();
 
-          print_mem ("before CFD", gpuID);
+          
           chebyshev_filter_pass (search_vectors, scaled_matrix, w, N, exec, this_exec); // Step 6
-          print_mem ("after CFD", gpuID);
+          
 
           int r_now = svqb (search_vectors, N, exec, this_exec, gpuID); // Step 7
           if (r_now == 0)
@@ -1145,8 +1146,8 @@ if (random_num >= interpolated_rho)
 
           RitzResult R = rayleigh_ritz (search_vectors, A, N, exec, this_exec, gpuID); // Step 8
 
-          // Print the middle 20 Ritz pairs
-          std::cout << "\n[Ritz pairs @ outer " << outer << "]" << std::endl;
+         
+          std::cout << "\n[Ritz pairs for interation: " << outer << "]" << std::endl;
           std::cout << " index        lambda_tilde              ||r||_2          rel_res" << std::endl;
           int total = (int) R.lam.size ();
           int mid = total / 2;
@@ -1218,7 +1219,7 @@ if (random_num >= interpolated_rho)
                 }
               if (outer == max_outer)
                 {
-                  std::cout << "[RR] Reached max_outer=" << max_outer << " with " << mc_count << " total accepted pairs.\n";
+                  std::cout << "[RR] Reached max_outer=" << max_outer <<"\n";
                   break;
                 }
             }
