@@ -1,4 +1,4 @@
-# A Method for Finding Eigenstates Near an Energy of Interest For Large Sparse Matrices: An Example
+# A Method for Finding Eigenstates Near an Energy of Interest For Large Sparse Matrices
 
 This repository is intended to be supplementary material for paper : (paper goes here). If you find this prior to paper submission, please email me at nchlandaATbrynmawr.edu
 
@@ -10,12 +10,6 @@ Furthermore, if you are interested in Ginkgo, this is a great way to see how to 
 
 
   If you desire information about specific eigenstates of your system, but your dimension size is much greater than what is possible via exact diagonalizaiton, this method gives you a way around that.
-
-
-  # Example: Testing the weak Eigenstate Thermalization Hypothesis (wETH)
-
-  We apply this method to testing the wETH, more information of our technique can be found here in this paper (cite). However, briefly, we estimate the density of eigenvalues across the whole spectrum (KPM), repeatedly pick a random energy somewhere in a desired spectrum (exp. middle 1/3), and create a small window surrounding that energy, then use a polynomial filter + a small dense eigensolver to pull out the eigenpairs that live there (CFD). It keeps doing this until it has collected as many eigenpairs as you asked for (mc_target), each passing a residual check.
-
  
  # The 10-step pipeline
 
