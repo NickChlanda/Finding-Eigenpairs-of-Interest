@@ -4,7 +4,7 @@ This program is meant to give researchers a easy method for finding eigenstates 
 
 Furthermore, if you are interested in Ginkgo, this is a great way to see how to implement various things.
 
-This repository is intended to be material for paper : (paper goes here). If you find this prior to paper submission, please email me at nchlandaATbrynmawr.edu
+This repository is intended to be material for paper :  . If you find this prior to paper submission, please email me at nchlandaATbrynmawr.edu
 
  # What problem this solves
 
