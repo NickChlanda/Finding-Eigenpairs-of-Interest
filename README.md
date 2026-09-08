@@ -33,7 +33,7 @@ Furthermore, if you are interested in Ginkgo, this is a great way to see how to 
       [compute_chebyshev_moments(), apply_jackson_kernel(), reconstruct_dos()]
   
    5. Monte-Carlo targeting: repeatedly draw a candidate energy from the
-      reconstructed DOS by rejection sampling. 
+      reconstructed DOS by rejection sampling.
       [main(), Monte-Carlo while loop]
   
    6. Adaptive window: for each accepted draw, create a window that contains a set number of
