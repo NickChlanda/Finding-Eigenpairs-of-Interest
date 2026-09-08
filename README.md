@@ -78,7 +78,7 @@ Furthermore, if you are interested in Ginkgo, this is a great way to see how to 
  
   **Run**: ./ matrixname.mtx <gpu_id> <NP> <NT> <max_outer> <target_frac> <mc_target> <ns_max>
   
-  **Example**: ./wETH matrix_out.txt 0 100 200 5 0.5 1000 600
+  **Example**: ./filename matrix_out.txt 0 100 200 5 0.5 1000 600
  
   **matrix.mtx**: sparse matrix, MatrixMarket text format.
   
