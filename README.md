@@ -60,7 +60,7 @@ This repository is intended to be material for paper :  . If you find this prior
  
   # Input
 
-  A sparse matrix in MatrixMarket coordinate text format. In the code currently it is read from a file via command line, but can easily be loaded "in code" as well.
+  A sparse matrix in MatrixMarket coordinate text format. 
  
   # Outputs
 
