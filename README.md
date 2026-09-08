@@ -66,7 +66,7 @@ Furthermore, if you are interested in Ginkgo, this is a great way to see how to 
  
   # Input
 
-  A sparse matrix in MatrixMarket coordinate text format.
+  A sparse matrix in MatrixMarket coordinate text format. In the code currently it is read from a file via command line, but can easily be loaded "in code" as well.
  
   # Outputs
 
