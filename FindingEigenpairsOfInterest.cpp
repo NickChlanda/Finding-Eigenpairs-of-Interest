@@ -1,8 +1,5 @@
-
 #include "mkl_lapacke.h"
-
 #include <ginkgo/ginkgo.hpp>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -13,7 +10,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
 #include "netcdf.h"
 #include <cuda.h>
 
