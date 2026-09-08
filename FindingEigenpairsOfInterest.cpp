@@ -122,7 +122,7 @@ int main (int argc, char *argv[])
   auto start = high_resolution_clock::now ();
 
   // --- Spectral bounds via short Lanczos + LAPACKE on T_k ---
-  const int k_lanczos = 30; // 8-16 is usually plenty
+  const int k_lanczos = 30; // 8-16 is usually plenty, large matricies may require more
   const double tol_lanc = 1e-20;
   
 
@@ -221,12 +221,6 @@ double best_rel_res = std::numeric_limits<double>::infinity ();
 double worst_rel_res = 0.0;
 long long total_duplicates_found = 0;
 long long total_dedup_candidates = 0;
-
-  // Counts consecutive rejected rejection-sampling draws. Declared outside
-  // the while loop so it actually accumulates across
-  // draws instead of resetting to 0 every pass. Capped at max_outer, so the
-  // same knob that limits filter/SVQB/RR retries also limits how long we'll
-  // keep rejection-sampling before warning and giving the counter a rest.
 
   int mc_draw_attempts = 0; 
   
@@ -548,8 +542,6 @@ if (random_num >= interpolated_rho)
  * lambda_max. 
  * ---------------------------------------------------------------------------*/
  
-
-
 static LanczosSpecBounds
 lanczos_bounds (std::shared_ptr<gko::matrix::Csr<real_precision> > A, int k_max, double tol, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> host_exec)
 {
