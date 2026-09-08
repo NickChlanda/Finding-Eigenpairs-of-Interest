@@ -1,5 +1,3 @@
-// main starts on line 825
-
 #include "mkl_lapacke.h"
 #include <ginkgo/ginkgo.hpp>
 #include <algorithm>
@@ -23,35 +21,539 @@ using real_vec = gko::matrix::Dense<real_precision>;
 using mtx = gko::matrix::Csr<real_precision>;
 using VecPtr = std::shared_ptr<vec>;
 
-/* -----------------------------------------------------------------------------
- * NetCDF error reporting.
- *
- * Kept from the original (which used this same handle_error() for its
- * NetCDF state-file reads). It only prints; it does not exit, exactly as
- * before.
- * ---------------------------------------------------------------------------*/
-static void
-handle_error (int status)
-{
-  if (status != NC_NOERR)
-    printf ("%s\n", nc_strerror (status));
-}
 
-/* -----------------------------------------------------------------------------
- * Lanczos-based spectral bounds via small tridiagonal diagonalization.
- * Given a Hermitian A, produce upper and lower bounds on lambda_min and
- * lambda_max. 
- * ---------------------------------------------------------------------------*/
-struct LanczosSpecBounds
+  struct RitzResult
+{
+  std::vector<VecPtr> v;
+  std::vector<double> lam;
+  std::vector<double> rn;
+};
+
+struct AcceptedPair
+{
+  double lam;
+  double rn;
+  std::vector<double> vec;
+};
+
+
+  struct LanczosSpecBounds
 {
   double mu_min = 0.0, mu_max = 0.0, beta_k1 = 0.0;
   double lam_min_lower = 0.0, lam_min_upper = 0.0;
   double lam_max_lower = 0.0, lam_max_upper = 0.0;
 };
 
+static void handle_error (int status);
+static LanczosSpecBounds lanczos_bounds (std::shared_ptr<gko::matrix::Csr<real_precision>> A, int k_max, double tol, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> host_exec);
+static void print_mem (const std::string &label, int gpuID);
+static std::vector<double> compute_chebyshev_moments (std::shared_ptr<gko::LinOp> scaled_matrix, gko::size_type N, int num_moments, int num_random_vecs, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> this_exec);
+static std::vector<double> apply_jackson_kernel (const std::vector<double> &moments);
+static void reconstruct_dos (const std::vector<double> &filtered_moments, int num_points, double a, double b, std::vector<double> &energies, std::vector<double> &rho);
+static double integrate_rho (const std::vector<double> &E_scaled, const std::vector<double> &rho, double lo, double hi);
+static double expected_eigs_window (const std::vector<double> &E_scaled, const std::vector<double> &rho, double center, double half_width, double full_lo, double full_hi, double I_full, double N_total);
+static double bisect_half_width (const std::vector<double> &E_scaled, const std::vector<double> &rho, double center, double target_count, double full_lo, double full_hi, double I_full, double N_total, int num_iters);
+static double clamp11 (double x);
+static std::vector<double> build_window_coefficients (double lower_use, double upper_use, double alpha, double beta, int NP);
+static void print_norm (const std::string &label, VecPtr v, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> this_exec);
+static void chebyshev_filter_pass (std::vector<VecPtr> &X, std::shared_ptr<gko::LinOp> scaled_matrix, const std::vector<double> &w, gko::size_type N, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> this_exec);
+static int svqb (std::vector<VecPtr> &X, gko::size_type N, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> this_exec, int gpuID);
+static RitzResult rayleigh_ritz (const std::vector<VecPtr> &X, std::shared_ptr<mtx> A, gko::size_type N, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> this_exec, int gpuID);
+
+
+
+int main (int argc, char *argv[])
+{
+  using namespace std::chrono;
+
+  if (argc < 9)
+    {
+      std::cerr << "Usage: " << argv[0]
+                << " <matrix.mtx> <gpu_id> <NP> <NT> <max_outer> <target_frac> <mc_target> <ns_max>\n";
+      return EXIT_FAILURE;
+    }
+
+  int c = 1;
+  char *matFile = argv[c++];
+  int gpuID = atoi (argv[c++]);
+  int NP = atoi (argv[c++]);
+  int NT = atoi (argv[c++]);
+  int max_outer = atoi (argv[c++]);
+  double target_frac = atof (argv[c++]);
+  int mc_target = atoi (argv[c++]);
+  int ns_max = atoi (argv[c++]);
+
+  std::cout << gko::version_info::get () << std::endl;
+  std::cout << std::scientific << std::setprecision (8) << std::showpos;
+
+  /************** Create the CUDA executor ************************/
+  int device_id = gpuID;
+  auto exec = gko::CudaExecutor::create (device_id, gko::ReferenceExecutor::create ());
+  auto this_exec = exec->get_master ();
+
+  /********** Load the matrix from a MatrixMarket / plain-text file *********/
+  std::ifstream mat_stream (matFile);
+  if (!mat_stream)
+    {
+      std::cerr << "Cannot open matrix file: " << matFile << "\n";
+      return EXIT_FAILURE;
+    }
+  auto A = share (gko::read<mtx> (mat_stream, exec));
+  const gko::int64 N = A->get_size ()[0];
+  std::cout << "Loaded " << matFile << ": N = " << N
+            << ", nnz = " << A->get_num_stored_elements () << "\n";
+
+  double min_lower_use = std::numeric_limits<double>::infinity ();
+  double max_upper_use = -std::numeric_limits<double>::infinity ();
+
+  std::string exp_hitsFile = "ritz_hits_gpu" + std::to_string (gpuID) + ".nc";
+
+  int retval, nc_hits_id, hit_dimid, hits_varid;
+  retval = nc_create (exp_hitsFile.c_str (), NC_CLOBBER, &nc_hits_id);
+  handle_error (retval);
+  retval = nc_def_dim (nc_hits_id, "n", NC_UNLIMITED, &hit_dimid);
+  handle_error (retval);
+  retval = nc_def_var (nc_hits_id, "DATA", NC_DOUBLE, 1, &hit_dimid, &hits_varid);
+  handle_error (retval);
+  retval = nc_enddef (nc_hits_id);
+  handle_error (retval);
+  size_t hit_index = 0;
+
+  auto start = high_resolution_clock::now ();
+
+  // --- Spectral bounds via short Lanczos + LAPACKE on T_k ---
+  const int k_lanczos = 30; // 8-16 is usually plenty
+  const double tol_lanc = 1e-20;
+  
+
+  auto L = lanczos_bounds (A, k_lanczos, tol_lanc, exec, this_exec);
+
+  const real_precision min_eig = static_cast<real_precision> (L.lam_min_lower);
+  const real_precision max_eig = static_cast<real_precision> (L.lam_max_upper);
+
+
+  std:: cout << "  Lower bound: " << L.lam_min_lower << "\n"<< "  Upper bound: " << L.lam_max_upper << "\n";
+
+  // input min and max, epsilon defines the shift to get the scale to be -1,1
+  const real_precision epsilon = 1e-2;
+  const real_precision E_min = min_eig;
+  const real_precision E_max = max_eig;
+
+  // equations 26 and 27 https://doi.org/10.1103/RevModPhys.78.275
+  // transforming the scale of Emin and Emax to (-1,1)
+  auto a = (E_max - E_min) / (2.0 - epsilon);
+  auto b = (E_max + E_min) / 2.0;
+
+  // New alpha and beta for: (A - bI) / a
+  auto alpha = real_precision{ 1.0 } / a;
+  auto beta = -b / a;
+
+  // Construct rescaled matrix: alpha * A + beta * I
+  auto scaled_matrix = share (gko::Combination<real_precision>::create (gko::initialize<vec> ({ alpha }, exec), A, gko::initialize<vec> ({ beta }, exec), gko::matrix::Identity<real_precision>::create (exec, N)));
+
+  // === Step 2: Chebyshev Moments ===
+  const int num_moments = 100;
+  
+  const int num_random_vecs = 1;
+
+  std::vector<double> moments = compute_chebyshev_moments (scaled_matrix, N, num_moments, num_random_vecs, exec, this_exec);
+
+  // === Step 4: Jackson Kernel ===
+  std::vector<double> filtered_moments = apply_jackson_kernel (moments);
+
+  // === Step 5: Spectral Density Reconstruction ===
+  const int num_points = 0.3 * N;
+  
+
+  std::vector<double> energies, rho;
+  reconstruct_dos (filtered_moments, num_points, a, b, energies, rho);
+
+  std::ofstream rho_out ("spectrum.txt");
+  rho_out << "# E_scaled rho(E_scaled)\n";
+  for (int i = 0; i < num_points; ++i)
+    rho_out << energies[i] << " " << rho[i] << "\n";
+  rho_out.close ();
+
+
+  std::cout << "Wrote spectral density to spectrum.txt\n";
+
+  /*
+     Chebyshev Filter Diagonalization starts here
+  */
+
+
+
+  // Energy grid from KPM, rho already defined
+  std::vector<double> E_scaled = energies;
+
+  std::random_device rd;
+  std::mt19937 gen (rd ());
+
+  const double full_lo = E_min;
+  const double full_hi = E_max;
+  const double I_full = integrate_rho (E_scaled, rho, E_min, E_max);
+
+  // -------------------------------
+  // Build initial global window
+  // -------------------------------
+  double E_center = 0;
+  const double target_N = target_frac * static_cast<double> (N);
+
+  double half_width = bisect_half_width (E_scaled, rho, E_center, target_N, full_lo, full_hi, I_full, N, 60);
+
+  // final symmetric window around E_center
+  double big_lower = std::max (full_lo, E_center - half_width);
+  double big_upper = std::min (full_hi, E_center + half_width);
+
+  double I_big = integrate_rho (E_scaled, rho, big_lower, big_upper);
+  double N_big = N * (I_big / I_full);
+
+
+  std::uniform_real_distribution<double> dist3 (big_lower, big_upper);
+  std::uniform_real_distribution<double> uni01 (0.0, 1);
+
+  // --- Monte Carlo controls ---
+  int MC_TARGET = mc_target; // Set how many eigenvectors to sample
+
+  int mc_count = 0;
+  double sum_rel_res = 0.0;
+double best_rel_res = std::numeric_limits<double>::infinity ();
+double worst_rel_res = 0.0;
+long long total_duplicates_found = 0;
+long long total_dedup_candidates = 0;
+
+  // Counts consecutive rejected rejection-sampling draws. Declared outside
+  // the while loop so it actually accumulates across
+  // draws instead of resetting to 0 every pass. Capped at max_outer, so the
+  // same knob that limits filter/SVQB/RR retries also limits how long we'll
+  // keep rejection-sampling before warning and giving the counter a rest.
+
+  int mc_draw_attempts = 0; 
+  
+
+  while (mc_count < MC_TARGET)
+    {
+      // One MC draw -> bracket & acceptance test
+      //  - Locate [E_i,E_{i+1}] such that E_i <= z_new <= E_{i+1}.
+      //  - Interpolate rho(z_new) linearly and accept if u < rho(z_new).
+      double z_new = dist3 (gen);      // randomly chosen energy
+      double random_num = uni01 (gen); // random number
+
+      auto it = std::upper_bound (E_scaled.begin (), E_scaled.end (), z_new);
+      int lower_idx = std::max (0, (int) (it - E_scaled.begin ()) - 1);
+
+      double E1 = E_scaled[lower_idx];
+      double E2 = E_scaled[lower_idx + 1];
+
+      double rho1 = rho[lower_idx];
+      double rho2 = rho[lower_idx + 1];
+
+      double interpolated_rho = rho1 + (rho2 - rho1) * ((z_new - E1) / (E2 - E1));
+
+      
+
+      // monte carlo check
+if (random_num >= interpolated_rho)
+  {
+    mc_draw_attempts++;
+    if (mc_draw_attempts >= 1000)
+      {
+        std::cout << "Failed the MC draw after 1000 attempts\n";
+        mc_draw_attempts = 0;
+      }
+    continue;
+  }
+
+      mc_draw_attempts = 0;   // reset the moment a draw is accepted
+
+
+
+      const int target_eigs = NT;
+
+      // Center the window on z_new
+      E_center = z_new;
+
+      std::cout << "random selected energy: "<< z_new << std::endl;
+
+      // Bisection to find half-width giving target_eigs eigenvalues
+      double win_half_width = bisect_half_width (E_scaled, rho, E_center, target_eigs, full_lo, full_hi, I_full, N, 50);
+
+      // Final window bounds
+      double lower_use = std::max (big_lower, E_center - win_half_width);
+      double upper_use = std::min (big_upper, E_center + win_half_width);
+
+      // NOTE: rho is invariant across the whole run; recomputing max_rho on
+      // every Monte-Carlo draw is wasteful but kept exactly as original.
+      double max_rho = *std::max_element (rho.begin (), rho.end ());
+
+      // Final values
+      const int NS = std::min (2 * NT, ns_max);
+
+      // mean rho over [lower_use, upper_use] -> how many pairs to keep from this window
+      double sum_win = 0.0;
+      int count_win = 0;
+      for (int i = 0; i < num_points; ++i)
+        {
+          if (energies[i] >= lower_use && energies[i] <= upper_use)
+            {
+              sum_win += rho[i];
+              count_win++;
+            }
+        }
+      double mean_rho_window = (count_win > 0) ? sum_win / count_win : 0.0;
+      double p = mean_rho_window / max_rho;
+      int n_accept = std::max ((int) (p * NT), 20);
+
+    std::cout << "Window: [" << lower_use << ", " << upper_use << "]"<< std::endl;
+    std::cout << "window is set to contain this many eigenvalues =" << NT << std::endl;
+    std::cout <<  "creating this many search vectors =" << NS << std::endl;
+    std::cout <<"polynomial degree =" << NP << std::endl;
+
+      min_lower_use = std::min (min_lower_use, lower_use);
+      max_upper_use = std::max (max_upper_use, upper_use);
+
+      // Random search block (NS vectors) & normalization
+      std::vector<VecPtr> search_vectors;
+      search_vectors.reserve (NS);
+      std::normal_distribution<double> normal (0.0, 1.0);
+
+      
+
+      for (int k = 0; k < NS; ++k)
+        {
+          auto work = vec::create (this_exec, gko::dim<2>{ N, 1 });
+          for (gko::size_type i = 0; i < N; ++i)
+            {
+              double re = normal (gen);
+              work->get_values ()[i] = real_precision{ re };
+            }
+          long double s = 0.0L;
+          for (gko::size_type i = 0; i < N; ++i)
+            s += std::norm (work->get_values ()[i]);
+          double inv_norm = (s > 0.0L) ? 1.0 / std::sqrt ((double) s) : 1.0;
+          for (gko::size_type i = 0; i < N; ++i)
+            work->get_values ()[i] *= inv_norm;
+          search_vectors.push_back (gko::share (clone (exec, work)));
+        }
+
+     
+
+      // Window coefficients (Lanczos kernel * step function on [lower_use, upper_use])
+      std::vector<double> w = build_window_coefficients (lower_use, upper_use, alpha, beta, NP);
+
+      // Restart loop & acceptance test:
+      //  Iterate filter -> SVQB -> RR; accept in-window Ritz pairs whose
+      //  residual <= tau_keep.
+      const double tau_keep = 1e-3;
+
+      std::vector<AcceptedPair> all_accepted;
+
+      int outer = 1;
+      while ((int) all_accepted.size () < n_accept && outer <= max_outer)
+        {
+          all_accepted.clear ();
+
+          
+          chebyshev_filter_pass (search_vectors, scaled_matrix, w, N, exec, this_exec); // Step 6
+          
+
+          int r_now = svqb (search_vectors, N, exec, this_exec, gpuID); // Step 7
+          if (r_now == 0)
+            {
+              // refill with fresh randoms if completely dropped
+              search_vectors.clear ();
+              std::mt19937 rng2 (1234 + outer);
+              std::normal_distribution<double> N01 (0.0, 1.0);
+              while ((int) search_vectors.size () < NS)
+                {
+                  auto col_h = vec::create (this_exec, gko::dim<2>{ N, 1 });
+                  long double ss = 0.0L;
+                  for (gko::size_type i = 0; i < N; ++i)
+                    {
+                      double re = N01 (rng2);
+                      col_h->at (i, 0) = real_precision{ re };
+                      ss += re * re;
+                    }
+                  double invn = (ss > 0.0L) ? 1.0 / std::sqrt ((double) ss) : 1.0;
+                  for (gko::size_type i = 0; i < N; ++i)
+                    col_h->at (i, 0) *= invn;
+                  auto col_d = gko::share (clone (exec, col_h));
+                  search_vectors.push_back (col_d);
+                }
+              continue; // try again
+            }
+
+          RitzResult R = rayleigh_ritz (search_vectors, A, N, exec, this_exec, gpuID); // Step 8
+
+         
+          std::cout << "\n[Ritz pairs for interation: " << outer << "]" << std::endl;
+          std::cout << " index        lambda_tilde              ||r||_2          rel_res" << std::endl;
+          int total = (int) R.lam.size ();
+          int mid = total / 2;
+          int print_start = std::max (0, mid - 10);
+          int print_end = std::min (total, mid + 10);
+          for (int j = print_start; j < print_end; ++j)
+            {
+              double rel_res = (std::abs (R.lam[j]) > 0) ? R.rn[j] / std::abs (R.lam[j]) : R.rn[j];
+              std::cout << "  " << std::setw (4) << j
+                        << "  " << std::setprecision (12) << std::setw (20) << R.lam[j]
+                        << "  " << std::setprecision (6) << std::setw (12) << R.rn[j]
+                        << "  " << std::setprecision (6) << std::setw (12) << rel_res
+                        << std::endl;
+            }
+
+          // Collect in-window Ritz pairs passing the residual test, deduplicated
+          std::vector<int> accepted_indices;
+          int duplicates_removed = 0;
+
+          for (int j = 0; j < (int) R.lam.size (); ++j)
+            {
+              if (R.lam[j] >= lower_use && R.lam[j] <= upper_use)
+                {
+                  double rel_res = R.rn[j] / std::abs (R.lam[j]);
+                  if (rel_res <= tau_keep)
+                    {
+                      bool duplicate = false;
+                      for (int i = 0; i < (int) accepted_indices.size (); ++i)
+                        {
+                          int k = accepted_indices[i];
+                          double lam_diff = std::abs (R.lam[j] - R.lam[k]) / std::abs (R.lam[k]);
+                          if (lam_diff < 1e-5)
+                            {
+                              if (R.rn[j] < R.rn[k])
+                                {
+                                  accepted_indices.erase (accepted_indices.begin () + i);
+                                  accepted_indices.push_back (j);
+                                }
+                              duplicate = true;
+                              duplicates_removed++;
+                              break;
+                            }
+                        }
+                      if (!duplicate)
+                        accepted_indices.push_back (j);
+                    }
+                }
+            }
+
+          std::cout << "[RR] Accepted " << accepted_indices.size ()
+                    << " in-window Ritz pairs with residual <= " << tau_keep << std::endl;
+
+                total_duplicates_found += duplicates_removed;
+                total_dedup_candidates += (int) accepted_indices.size () + duplicates_removed;
+
+          if (!accepted_indices.empty ())
+            {
+              for (int jj : accepted_indices)
+                {
+                  auto v_h = gko::clone (this_exec, R.v[jj]);
+                  const auto nloc = v_h->get_size ()[0];
+
+                  AcceptedPair ap;
+                  ap.lam = R.lam[jj];
+                  ap.rn = R.rn[jj];
+                  const auto *vals = v_h->get_const_values ();
+                  ap.vec.assign (vals, vals + nloc);
+                  all_accepted.push_back (ap);
+                }
+              if (outer == max_outer)
+                {
+                  std::cout << "[RR] Reached max_outer=" << max_outer <<"\n";
+                  break;
+                }
+            }
+          outer++;
+        }
+
+      if ((int) all_accepted.size () > n_accept)
+        {
+          std::shuffle (all_accepted.begin (), all_accepted.end (), gen);
+          all_accepted.resize (n_accept);
+        }
+
+      std::cout << "[SUBSAMPLE] Keeping " << all_accepted.size ()
+                << " of converged pairs (n_accept=" << n_accept << ")\n";
+
+      // Write accepted pairs to the NetCDF output.
+      // Each accepted pair contributes 3 doubles to the "DATA" variable:
+      // lambda, residual norm, and the first component of the Ritz vector
+      
+      // The full Ritz vector is available in ap.vec if you want to compute things with it
+      // e.g. loop over ap.vec and nc_put_var1_double each entry.
+      for (int k = 0; k < (int) all_accepted.size (); ++k)
+        {
+          const auto &ap = all_accepted[k];
+
+          nc_put_var1_double (nc_hits_id, hits_varid, &hit_index, &ap.lam);
+          hit_index++;
+          nc_put_var1_double (nc_hits_id, hits_varid, &hit_index, &ap.rn);
+          hit_index++;
+          nc_put_var1_double (nc_hits_id, hits_varid, &hit_index, &ap.vec[0]);
+          hit_index++;
+
+          mc_count++;
+          const double rel_res = std::abs (ap.lam) > 0.0 ? ap.rn / std::abs (ap.lam) : ap.rn;
+        sum_rel_res += rel_res;
+        best_rel_res = std::min (best_rel_res, rel_res);
+        worst_rel_res = std::max (worst_rel_res, rel_res);
+        }
+      nc_sync (nc_hits_id);
+      std::cout << "[Progress] Total eigenvectors collected: " << mc_count << " / " << MC_TARGET << "\n";
+    }
+
+  std::cout << "----------------------------------" << std::endl;
+  std::cout << "Adaptive window summary:\n"
+            << "  min_lower   = " << std::setprecision (17) << min_lower_use << "\n"
+            << "  max_upper   = " << std::setprecision (17) << max_upper_use << "\n";
+
+            std::cout << "----------------------------------" << std::endl;
+  std::cout << "Eigenvector summary:\n"
+            << "  eigenvectors found = " << mc_count << "\n";
+  if (mc_count > 0)
+   {
+      const double mean_rel_res = sum_rel_res / mc_count;
+      std::cout << "  mean accuracy = " << std::setprecision (6) << (1.0 - mean_rel_res) * 100.0 << "%"
+                << "  (mean relative residual = " << mean_rel_res << ")\n"
+                << "  best  accuracy = " << (1.0 - best_rel_res) * 100.0 << "%"
+                << "  (best  relative residual = " << best_rel_res << ")\n"
+                << "  worst accuracy = " << (1.0 - worst_rel_res) * 100.0 << "%"
+                << "  (worst relative residual = " << worst_rel_res << ")\n";
+    }
+    std::cout << "Duplicate summary:\n"
+          << "  duplicates found = " << total_duplicates_found
+          << " out of " << total_dedup_candidates << " converged candidates";
+    if (total_dedup_candidates > 0)
+        std::cout << "  (" << std::setprecision (4)
+            << (100.0 * total_duplicates_found / total_dedup_candidates) << "%)";
+        std::cout << "\n";  
+
+  auto stop = high_resolution_clock::now ();
+  auto duration = duration_cast<microseconds> (stop - start);
+
+  std::cout << "----------------------------------" << std::endl;
+  std::cout << "Time to run code: "
+            << duration.count () / 1000000 << " seconds" << std::endl;
+
+  nc_close (nc_hits_id);
+  return EXIT_SUCCESS;
+}
+
+
+
+//functions declared below
+
+/* -----------------------------------------------------------------------------
+ * Lanczos-based spectral bounds via small tridiagonal diagonalization.
+ * Given a Hermitian A, produce upper and lower bounds on lambda_min and
+ * lambda_max. 
+ * ---------------------------------------------------------------------------*/
+ 
+
+
 static LanczosSpecBounds
 lanczos_bounds (std::shared_ptr<gko::matrix::Csr<real_precision> > A, int k_max, double tol, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> host_exec)
 {
+  
   // get size
   const auto n = A->get_size ()[0];
   LanczosSpecBounds out;
@@ -717,12 +1219,7 @@ svqb (std::vector<VecPtr> &X, gko::size_type N, std::shared_ptr<gko::Executor> e
  *   Y = [X], AY = A*Y, H = sym(Y^T A Y), eig(H) = U theta U^T.
  *   Ritz vectors v_j = Y u_j; residuals r_j = ||A v_j - theta_j v_j||_2.
  * ---------------------------------------------------------------------------*/
-struct RitzResult
-{
-  std::vector<VecPtr> v;   // Ritz vectors
-  std::vector<double> lam; // Ritz values theta_j (host)
-  std::vector<double> rn;  // residual norms ||A v_j - theta_j v_j||_2
-};
+
 
 static RitzResult
 rayleigh_ritz (const std::vector<VecPtr> &X, std::shared_ptr<mtx> A, gko::size_type N, std::shared_ptr<gko::Executor> exec, std::shared_ptr<gko::Executor> this_exec, int gpuID)
@@ -809,485 +1306,11 @@ rayleigh_ritz (const std::vector<VecPtr> &X, std::shared_ptr<mtx> A, gko::size_t
 }
 
 /* -----------------------------------------------------------------------------
- * Step 9: an accepted, converged, in-window Ritz pair.
+ * NetCDF error reporting.
  * ---------------------------------------------------------------------------*/
-struct AcceptedPair
+static void
+handle_error (int status)
 {
-  double lam;
-  double rn;
-  std::vector<double> vec;
-};
-
-/* -----------------------------------------------------------------------------
- * main
- * ---------------------------------------------------------------------------*/
-int
-main (int argc, char *argv[])
-{
-  using namespace std::chrono;
-
-  if (argc < 9)
-    {
-      std::cerr << "Usage: " << argv[0]
-                << " <matrix.mtx> <gpu_id> <NP> <NT> <max_outer> <target_frac> <mc_target> <ns_max>\n";
-      return EXIT_FAILURE;
-    }
-
-  int c = 1;
-  char *matFile = argv[c++];
-  int gpuID = atoi (argv[c++]);
-  int NP = atoi (argv[c++]);
-  int NT = atoi (argv[c++]);
-  int max_outer = atoi (argv[c++]);
-  double target_frac = atof (argv[c++]);
-  int mc_target = atoi (argv[c++]);
-  int ns_max = atoi (argv[c++]);
-
-  std::cout << gko::version_info::get () << std::endl;
-  std::cout << std::scientific << std::setprecision (8) << std::showpos;
-
-  /************** Create the CUDA executor ************************/
-  int device_id = gpuID;
-  auto exec = gko::CudaExecutor::create (device_id, gko::ReferenceExecutor::create ());
-  auto this_exec = exec->get_master ();
-
-  /********** Load the matrix from a MatrixMarket / plain-text file *********/
-  std::ifstream mat_stream (matFile);
-  if (!mat_stream)
-    {
-      std::cerr << "Cannot open matrix file: " << matFile << "\n";
-      return EXIT_FAILURE;
-    }
-  auto A = share (gko::read<mtx> (mat_stream, exec));
-  const gko::int64 N = A->get_size ()[0];
-  std::cout << "Loaded " << matFile << ": N = " << N
-            << ", nnz = " << A->get_num_stored_elements () << "\n";
-
-  double min_lower_use = std::numeric_limits<double>::infinity ();
-  double max_upper_use = -std::numeric_limits<double>::infinity ();
-
-  std::string exp_hitsFile = "ritz_hits_gpu" + std::to_string (gpuID) + ".nc";
-
-  int retval, nc_hits_id, hit_dimid, hits_varid;
-  retval = nc_create (exp_hitsFile.c_str (), NC_CLOBBER, &nc_hits_id);
-  handle_error (retval);
-  retval = nc_def_dim (nc_hits_id, "n", NC_UNLIMITED, &hit_dimid);
-  handle_error (retval);
-  retval = nc_def_var (nc_hits_id, "DATA", NC_DOUBLE, 1, &hit_dimid, &hits_varid);
-  handle_error (retval);
-  retval = nc_enddef (nc_hits_id);
-  handle_error (retval);
-  size_t hit_index = 0;
-
-  auto start = high_resolution_clock::now ();
-
-  // --- Spectral bounds via short Lanczos + LAPACKE on T_k ---
-  const int k_lanczos = 30; // 8-16 is usually plenty
-  const double tol_lanc = 1e-20;
-
-  auto L = lanczos_bounds (A, k_lanczos, tol_lanc, exec, this_exec);
-
-  const real_precision min_eig = static_cast<real_precision> (L.lam_min_lower);
-  const real_precision max_eig = static_cast<real_precision> (L.lam_max_upper);
-
-
-  std:: cout << "  Lower bound: " << L.lam_min_lower << "\n"<< "  Upper bound: " << L.lam_max_upper << "\n";
-
-  // input min and max, epsilon defines the shift to get the scale to be -1,1
-  const real_precision epsilon = 1e-2;
-  const real_precision E_min = min_eig;
-  const real_precision E_max = max_eig;
-
-  // equations 26 and 27 https://doi.org/10.1103/RevModPhys.78.275
-  // transforming the scale of Emin and Emax to (-1,1)
-  auto a = (E_max - E_min) / (2.0 - epsilon);
-  auto b = (E_max + E_min) / 2.0;
-
-  // New alpha and beta for: (A - bI) / a
-  auto alpha = real_precision{ 1.0 } / a;
-  auto beta = -b / a;
-
-  // Construct rescaled matrix: alpha * A + beta * I
-  auto scaled_matrix = share (gko::Combination<real_precision>::create (gko::initialize<vec> ({ alpha }, exec), A, gko::initialize<vec> ({ beta }, exec), gko::matrix::Identity<real_precision>::create (exec, N)));
-
-  // === Step 2: Chebyshev Moments ===
-  const int num_moments = 100;
-  
-  const int num_random_vecs = 1;
-
-  std::vector<double> moments = compute_chebyshev_moments (scaled_matrix, N, num_moments, num_random_vecs, exec, this_exec);
-
-  // === Step 4: Jackson Kernel ===
-  std::vector<double> filtered_moments = apply_jackson_kernel (moments);
-
-  // === Step 5: Spectral Density Reconstruction ===
-  const int num_points = 0.3 * N;
-  
-
-  std::vector<double> energies, rho;
-  reconstruct_dos (filtered_moments, num_points, a, b, energies, rho);
-
-  std::ofstream rho_out ("spectrum.txt");
-  rho_out << "# E_scaled rho(E_scaled)\n";
-  for (int i = 0; i < num_points; ++i)
-    rho_out << energies[i] << " " << rho[i] << "\n";
-  rho_out.close ();
-
-
-  std::cout << "Wrote spectral density to spectrum.txt\n";
-
-  /*
-     Chebyshev Filter Diagonalization starts here
-  */
-
-
-
-  // Energy grid from KPM, rho already defined
-  std::vector<double> E_scaled = energies;
-
-  std::random_device rd;
-  std::mt19937 gen (rd ());
-
-  const double full_lo = E_min;
-  const double full_hi = E_max;
-  const double I_full = integrate_rho (E_scaled, rho, E_min, E_max);
-
-  // -------------------------------
-  // Build initial global window
-  // -------------------------------
-  double E_center = 0;
-  const double target_N = target_frac * static_cast<double> (N);
-
-  double half_width = bisect_half_width (E_scaled, rho, E_center, target_N, full_lo, full_hi, I_full, N, 60);
-
-  // final symmetric window around E_center
-  double big_lower = std::max (full_lo, E_center - half_width);
-  double big_upper = std::min (full_hi, E_center + half_width);
-
-  double I_big = integrate_rho (E_scaled, rho, big_lower, big_upper);
-  double N_big = N * (I_big / I_full);
-
-
-  std::uniform_real_distribution<double> dist3 (big_lower, big_upper);
-  std::uniform_real_distribution<double> uni01 (0.0, 1);
-
-  // --- Monte Carlo controls ---
-  int MC_TARGET = mc_target; // Set how many eigenvectors to sample
-
-
-  // trackers
-int mc_count = 0;
-double sum_rel_res = 0.0;
-double best_rel_res = std::numeric_limits<double>::infinity ();
-double worst_rel_res = 0.0;
-long long total_duplicates_found = 0;
-long long total_dedup_candidates = 0;
-
-  int mc_draw_attempts = 0; 
-  
-
-  while (mc_count < MC_TARGET)
-    {
-      // One MC draw -> bracket & acceptance test
-      //  - Locate [E_i,E_{i+1}] such that E_i <= z_new <= E_{i+1}.
-      //  - Interpolate rho(z_new) linearly and accept if u < rho(z_new).
-      double z_new = dist3 (gen);      // randomly chosen energy
-      double random_num = uni01 (gen); // random number
-
-      auto it = std::upper_bound (E_scaled.begin (), E_scaled.end (), z_new);
-      int lower_idx = std::max (0, (int) (it - E_scaled.begin ()) - 1);
-
-      double E1 = E_scaled[lower_idx];
-      double E2 = E_scaled[lower_idx + 1];
-
-      double rho1 = rho[lower_idx];
-      double rho2 = rho[lower_idx + 1];
-
-      double interpolated_rho = rho1 + (rho2 - rho1) * ((z_new - E1) / (E2 - E1));
-
-      
-
-      // monte carlo check
-if (random_num >= interpolated_rho)
-  {
-    mc_draw_attempts++;
-    if (mc_draw_attempts >= 1000)
-      {
-        std::cout << "Failed the MC draw after 1000 attempts\n";
-        mc_draw_attempts = 0;
-      }
-    continue;
-  }
-
-      mc_draw_attempts = 0;   // reset the moment a draw is accepted
-
-
-
-      const int target_eigs = NT;
-
-      // Center the window on z_new
-      E_center = z_new;
-
-      std::cout << "random selected energy: "<< z_new << std::endl;
-
-      // Bisection to find half-width giving target_eigs eigenvalues
-      double win_half_width = bisect_half_width (E_scaled, rho, E_center, target_eigs, full_lo, full_hi, I_full, N, 50);
-
-      // Final window bounds
-      double lower_use = std::max (big_lower, E_center - win_half_width);
-      double upper_use = std::min (big_upper, E_center + win_half_width);
-
-
-      double max_rho = *std::max_element (rho.begin (), rho.end ());
-
-      // Final values
-      const int NS = std::min (2 * NT, ns_max);
-
-      // mean rho over [lower_use, upper_use] -> how many pairs to keep from this window
-      double sum_win = 0.0;
-      int count_win = 0;
-      for (int i = 0; i < num_points; ++i)
-        {
-          if (energies[i] >= lower_use && energies[i] <= upper_use)
-            {
-              sum_win += rho[i];
-              count_win++;
-            }
-        }
-      double mean_rho_window = (count_win > 0) ? sum_win / count_win : 0.0;
-      double p = mean_rho_window / max_rho;
-      int n_accept = std::max ((int) (p * NT), 20);
-
-    std::cout << "Window: [" << lower_use << ", " << upper_use << "]"<< std::endl;
-    std::cout << "window is set to contain this many eigenvalues =" << NT << std::endl;
-    std::cout <<  "creating this many search vectors =" << NS << std::endl;
-    std::cout <<"polynomial degree =" << NP << std::endl;
-
-      min_lower_use = std::min (min_lower_use, lower_use);
-      max_upper_use = std::max (max_upper_use, upper_use);
-
-      // Random search block (NS vectors) & normalization
-      std::vector<VecPtr> search_vectors;
-      search_vectors.reserve (NS);
-      std::normal_distribution<double> normal (0.0, 1.0);
-
-      
-
-      for (int k = 0; k < NS; ++k)
-        {
-          auto work = vec::create (this_exec, gko::dim<2>{ N, 1 });
-          for (gko::size_type i = 0; i < N; ++i)
-            {
-              double re = normal (gen);
-              work->get_values ()[i] = real_precision{ re };
-            }
-          long double s = 0.0L;
-          for (gko::size_type i = 0; i < N; ++i)
-            s += std::norm (work->get_values ()[i]);
-          double inv_norm = (s > 0.0L) ? 1.0 / std::sqrt ((double) s) : 1.0;
-          for (gko::size_type i = 0; i < N; ++i)
-            work->get_values ()[i] *= inv_norm;
-          search_vectors.push_back (gko::share (clone (exec, work)));
-        }
-
-     
-
-      // Window coefficients (Lanczos kernel * step function on [lower_use, upper_use])
-      std::vector<double> w = build_window_coefficients (lower_use, upper_use, alpha, beta, NP);
-
-      // Restart loop & acceptance test:
-      //  Iterate filter -> SVQB -> RR; accept in-window Ritz pairs whose
-      //  residual <= tau_keep.
-      const double tau_keep = 1e-3;
-
-      std::vector<AcceptedPair> all_accepted;
-
-      int outer = 1;
-      while ((int) all_accepted.size () < n_accept && outer <= max_outer)
-        {
-          all_accepted.clear ();
-
-          
-          chebyshev_filter_pass (search_vectors, scaled_matrix, w, N, exec, this_exec); // Step 6
-          
-
-          int r_now = svqb (search_vectors, N, exec, this_exec, gpuID); // Step 7
-          if (r_now == 0)
-            {
-              // refill with fresh randoms if completely dropped
-              search_vectors.clear ();
-              std::mt19937 rng2 (1234 + outer);
-              std::normal_distribution<double> N01 (0.0, 1.0);
-              while ((int) search_vectors.size () < NS)
-                {
-                  auto col_h = vec::create (this_exec, gko::dim<2>{ N, 1 });
-                  long double ss = 0.0L;
-                  for (gko::size_type i = 0; i < N; ++i)
-                    {
-                      double re = N01 (rng2);
-                      col_h->at (i, 0) = real_precision{ re };
-                      ss += re * re;
-                    }
-                  double invn = (ss > 0.0L) ? 1.0 / std::sqrt ((double) ss) : 1.0;
-                  for (gko::size_type i = 0; i < N; ++i)
-                    col_h->at (i, 0) *= invn;
-                  auto col_d = gko::share (clone (exec, col_h));
-                  search_vectors.push_back (col_d);
-                }
-              continue; // try again
-            }
-
-          RitzResult R = rayleigh_ritz (search_vectors, A, N, exec, this_exec, gpuID); // Step 8
-
-         
-          std::cout << "\n[Ritz pairs for interation: " << outer << "]" << std::endl;
-          std::cout << " index        lambda_tilde              ||r||_2          rel_res" << std::endl;
-          int total = (int) R.lam.size ();
-          int mid = total / 2;
-          int print_start = std::max (0, mid - 10);
-          int print_end = std::min (total, mid + 10);
-          for (int j = print_start; j < print_end; ++j)
-            {
-              double rel_res = (std::abs (R.lam[j]) > 0) ? R.rn[j] / std::abs (R.lam[j]) : R.rn[j];
-              std::cout << "  " << std::setw (4) << j
-                        << "  " << std::setprecision (12) << std::setw (20) << R.lam[j]
-                        << "  " << std::setprecision (6) << std::setw (12) << R.rn[j]
-                        << "  " << std::setprecision (6) << std::setw (12) << rel_res
-                        << std::endl;
-            }
-
-          // Collect in-window Ritz pairs passing the residual test, deduplicated
-          std::vector<int> accepted_indices;
-          int duplicates_removed = 0;
-
-          for (int j = 0; j < (int) R.lam.size (); ++j)
-            {
-              if (R.lam[j] >= lower_use && R.lam[j] <= upper_use)
-                {
-                  double rel_res = R.rn[j] / std::abs (R.lam[j]);
-                  if (rel_res <= tau_keep)
-                    {
-                      bool duplicate = false;
-                      for (int i = 0; i < (int) accepted_indices.size (); ++i)
-                        {
-                          int k = accepted_indices[i];
-                          double lam_diff = std::abs (R.lam[j] - R.lam[k]) / std::abs (R.lam[k]);
-                          if (lam_diff < 1e-5)
-                            {
-                              if (R.rn[j] < R.rn[k])
-                                {
-                                  accepted_indices.erase (accepted_indices.begin () + i);
-                                  accepted_indices.push_back (j);
-                                }
-                              duplicate = true;
-                              duplicates_removed++;
-                              break;
-                            }
-                        }
-                      if (!duplicate)
-                        accepted_indices.push_back (j);
-                    }
-                }
-            }
-
-          std::cout << "[RR] Accepted " << accepted_indices.size ()
-                    << " in-window Ritz pairs with residual <= " << tau_keep << std::endl;
-
-                total_duplicates_found += duplicates_removed;
-                total_dedup_candidates += (int) accepted_indices.size () + duplicates_removed;
-
-          if (!accepted_indices.empty ())
-            {
-              for (int jj : accepted_indices)
-                {
-                  auto v_h = gko::clone (this_exec, R.v[jj]);
-                  const auto nloc = v_h->get_size ()[0];
-
-                  AcceptedPair ap;
-                  ap.lam = R.lam[jj];
-                  ap.rn = R.rn[jj];
-                  const auto *vals = v_h->get_const_values ();
-                  ap.vec.assign (vals, vals + nloc);
-                  all_accepted.push_back (ap);
-                }
-              if (outer == max_outer)
-                {
-                  std::cout << "[RR] Reached max_outer=" << max_outer <<"\n";
-                  break;
-                }
-            }
-          outer++;
-        }
-
-      if ((int) all_accepted.size () > n_accept)
-        {
-          std::shuffle (all_accepted.begin (), all_accepted.end (), gen);
-          all_accepted.resize (n_accept);
-        }
-
-      std::cout << "[SUBSAMPLE] Keeping " << all_accepted.size ()
-                << " of converged pairs (n_accept=" << n_accept << ")\n";
-
-      // Write accepted pairs to the NetCDF output.
-      // Each accepted pair contributes 3 doubles to the "DATA" variable:
-      // lambda, residual norm, and the first component of the Ritz vector
-      
-      // The full Ritz vector is available in ap.vec if you want to compute things with it
-      // e.g. loop over ap.vec and nc_put_var1_double each entry.
-      for (int k = 0; k < (int) all_accepted.size (); ++k)
-        {
-          const auto &ap = all_accepted[k];
-
-          nc_put_var1_double (nc_hits_id, hits_varid, &hit_index, &ap.lam);
-          hit_index++;
-          nc_put_var1_double (nc_hits_id, hits_varid, &hit_index, &ap.rn);
-          hit_index++;
-          nc_put_var1_double (nc_hits_id, hits_varid, &hit_index, &ap.vec[0]);
-          hit_index++;
-
-          mc_count++;
-          const double rel_res = std::abs (ap.lam) > 0.0 ? ap.rn / std::abs (ap.lam) : ap.rn;
-        sum_rel_res += rel_res;
-        best_rel_res = std::min (best_rel_res, rel_res);
-        worst_rel_res = std::max (worst_rel_res, rel_res);
-        }
-      nc_sync (nc_hits_id);
-      std::cout << "[Progress] Total eigenvectors collected: " << mc_count << " / " << MC_TARGET << "\n";
-    }
-
-  std::cout << "----------------------------------" << std::endl;
-  std::cout << "Adaptive window summary:\n"
-            << "  min_lower   = " << std::setprecision (17) << min_lower_use << "\n"
-            << "  max_upper   = " << std::setprecision (17) << max_upper_use << "\n";
-
-            std::cout << "----------------------------------" << std::endl;
-  std::cout << "Eigenvector summary:\n"
-            << "  eigenvectors found = " << mc_count << "\n";
-  if (mc_count > 0)
-   {
-      const double mean_rel_res = sum_rel_res / mc_count;
-      std::cout << "  mean accuracy = " << std::setprecision (6) << (1.0 - mean_rel_res) * 100.0 << "%"
-                << "  (mean relative residual = " << mean_rel_res << ")\n"
-                << "  best  accuracy = " << (1.0 - best_rel_res) * 100.0 << "%"
-                << "  (best  relative residual = " << best_rel_res << ")\n"
-                << "  worst accuracy = " << (1.0 - worst_rel_res) * 100.0 << "%"
-                << "  (worst relative residual = " << worst_rel_res << ")\n";
-    }
-    std::cout << "Duplicate summary:\n"
-          << "  duplicates found = " << total_duplicates_found
-          << " out of " << total_dedup_candidates << " converged candidates";
-    if (total_dedup_candidates > 0)
-        std::cout << "  (" << std::setprecision (4)
-            << (100.0 * total_duplicates_found / total_dedup_candidates) << "%)";
-        std::cout << "\n";  
-
-  auto stop = high_resolution_clock::now ();
-  auto duration = duration_cast<microseconds> (stop - start);
-
-  std::cout << "----------------------------------" << std::endl;
-  std::cout << "Time to run code: "
-            << duration.count () / 1000000 << " seconds" << std::endl;
-
-  nc_close (nc_hits_id);
-  return EXIT_SUCCESS;
+  if (status != NC_NOERR)
+    printf ("%s\n", nc_strerror (status));
 }
