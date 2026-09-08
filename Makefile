@@ -45,7 +45,7 @@ HEAD =
 OBJS = $(SRCS:.cpp=.o)
 
 # define the executable file
-MAIN = wETH
+MAIN = execname
 
 #
 # The following part of the makefile is generic; it can be used to
