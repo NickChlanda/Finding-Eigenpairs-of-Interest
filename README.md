@@ -9,7 +9,7 @@ This repository is intended to be material for paper :  . If you find this prior
  # What problem this solves
 
 
-  If you desire information about specific eigenstates of your system, but your dimension size is much greater than what is possible via exact diagonalizaiton, this method gives you a way around that.
+  If you desire information about specific eigenstates of your system and have a sparse matrix, but your dimension size is much greater than what is possible via exact diagonalizaiton, this method gives you a way around that.
  
  # The 10-step pipeline
 
