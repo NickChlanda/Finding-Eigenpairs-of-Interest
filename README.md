@@ -72,7 +72,9 @@ This repository is intended to be material for paper :  . If you find this prior
                           
   **(console)**: Progress prints throughout the run (spectral bounds, per-window status, Ritz-pair tables, acceptance/duplicate/subsample counts), plus a final summary block (window coverage, eigenvector count + accuracy, duplicate rate, and timer).
 
-# Command Line
+# Implementation Choices and Command Line 
+
+  All Implementation choices can be found in the paper at the top of this repo.
 
   **Compile**: "make" in terminal which uses Makefile
  
