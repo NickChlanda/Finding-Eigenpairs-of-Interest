@@ -22,6 +22,8 @@ using mtx = gko::matrix::Csr<real_precision>;
 using VecPtr = std::shared_ptr<vec>;
 
 
+
+// structs and functions
   struct RitzResult
 {
   std::vector<VecPtr> v;
@@ -66,6 +68,8 @@ int main (int argc, char *argv[])
 {
   using namespace std::chrono;
 
+
+  // This helps explain the command line incase it is wrong.
   if (argc < 9)
     {
       std::cerr << "Usage: " << argv[0]
@@ -73,6 +77,7 @@ int main (int argc, char *argv[])
       return EXIT_FAILURE;
     }
 
+  //reading in inputs via command line
   int c = 1;
   char *matFile = argv[c++];
   int gpuID = atoi (argv[c++]);
@@ -126,8 +131,10 @@ int main (int argc, char *argv[])
   const double tol_lanc = 1e-20;
   
 
+  // run the function to find min and max eigenvalues
   auto L = lanczos_bounds (A, k_lanczos, tol_lanc, exec, this_exec);
 
+  // your min and max eigenvalues live here
   const real_precision min_eig = static_cast<real_precision> (L.lam_min_lower);
   const real_precision max_eig = static_cast<real_precision> (L.lam_max_upper);
 
@@ -165,9 +172,12 @@ int main (int argc, char *argv[])
   const int num_points = 0.3 * N;
   
 
+  //this is returning a density of states for your Hamiltonian
   std::vector<double> energies, rho;
   reconstruct_dos (filtered_moments, num_points, a, b, energies, rho);
 
+
+  //written to spectrum.txt
   std::ofstream rho_out ("spectrum.txt");
   rho_out << "# E_scaled rho(E_scaled)\n";
   for (int i = 0; i < num_points; ++i)
@@ -177,10 +187,6 @@ int main (int argc, char *argv[])
 
   std::cout << "Wrote spectral density to spectrum.txt\n";
 
-  /*
-     Chebyshev Filter Diagonalization starts here
-  */
-
 
 
   // Energy grid from KPM, rho already defined
@@ -189,6 +195,7 @@ int main (int argc, char *argv[])
   std::random_device rd;
   std::mt19937 gen (rd ());
 
+  // Integrating over entire spectrum
   const double full_lo = E_min;
   const double full_hi = E_max;
   const double I_full = integrate_rho (E_scaled, rho, E_min, E_max);
@@ -197,7 +204,7 @@ int main (int argc, char *argv[])
   // Build initial global window
   // -------------------------------
   double E_center = 0;
-  const double target_N = target_frac * static_cast<double> (N);
+  const double target_N = target_frac * static_cast<double> (N); 
 
   double half_width = bisect_half_width (E_scaled, rho, E_center, target_N, full_lo, full_hi, I_full, N, 60);
 
@@ -215,18 +222,22 @@ int main (int argc, char *argv[])
   // --- Monte Carlo controls ---
   int MC_TARGET = mc_target; // Set how many eigenvectors to sample
 
-  int mc_count = 0;
-  double sum_rel_res = 0.0;
+// to save data for final output
+int mc_count = 0;
+double sum_rel_res = 0.0;
 double best_rel_res = std::numeric_limits<double>::infinity ();
 double worst_rel_res = 0.0;
 long long total_duplicates_found = 0;
 long long total_dedup_candidates = 0;
+int mc_draw_attempts = 0; 
 
-  int mc_draw_attempts = 0; 
-  
+
+//start of main loop
 
   while (mc_count < MC_TARGET)
     {
+      //Monte Carlo-Like Sampling
+      
       // One MC draw -> bracket & acceptance test
       //  - Locate [E_i,E_{i+1}] such that E_i <= z_new <= E_{i+1}.
       //  - Interpolate rho(z_new) linearly and accept if u < rho(z_new).
@@ -264,7 +275,7 @@ if (random_num >= interpolated_rho)
 
       const int target_eigs = NT;
 
-      // Center the window on z_new
+      // Center the window on z_new, here is where you can specifically input a energy in which you would like to solve for.
       E_center = z_new;
 
       std::cout << "random selected energy: "<< z_new << std::endl;
@@ -296,8 +307,11 @@ if (random_num >= interpolated_rho)
         }
       double mean_rho_window = (count_win > 0) ? sum_win / count_win : 0.0;
       double p = mean_rho_window / max_rho;
+      //n_accept is designed to only take a specific amount of eigenvalues from a region of your spectrum, ie, at a more dense region
+      // it will take more. For some input paremeters, it may never reach this n_accept. 
       int n_accept = std::max ((int) (p * NT), 20);
 
+    //printing some info 
     std::cout << "Window: [" << lower_use << ", " << upper_use << "]"<< std::endl;
     std::cout << "window is set to contain this many eigenvalues =" << NT << std::endl;
     std::cout <<  "creating this many search vectors =" << NS << std::endl;
@@ -312,7 +326,7 @@ if (random_num >= interpolated_rho)
       std::normal_distribution<double> normal (0.0, 1.0);
 
       
-
+      //here we are creating NS random gaussian vectors
       for (int k = 0; k < NS; ++k)
         {
           auto work = vec::create (this_exec, gko::dim<2>{ N, 1 });
@@ -340,9 +354,12 @@ if (random_num >= interpolated_rho)
       //  residual <= tau_keep.
       const double tau_keep = 1e-3;
 
+      //storing
       std::vector<AcceptedPair> all_accepted;
 
       int outer = 1;
+      
+      // second main loop, looping for outer times.
       while ((int) all_accepted.size () < n_accept && outer <= max_outer)
         {
           all_accepted.clear ();
