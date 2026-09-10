@@ -396,7 +396,7 @@ if (random_num >= interpolated_rho)
 
           RitzResult R = rayleigh_ritz (search_vectors, A, N, exec, this_exec, gpuID); // Step 8
 
-         
+         //this is printing out residuals of the current iteration for the middle 20
           std::cout << "\n[Ritz pairs for interation: " << outer << "]" << std::endl;
           std::cout << " index        lambda_tilde              ||r||_2          rel_res" << std::endl;
           int total = (int) R.lam.size ();
@@ -447,6 +447,7 @@ if (random_num >= interpolated_rho)
                 }
             }
 
+          
           std::cout << "[RR] Accepted " << accepted_indices.size ()
                     << " in-window Ritz pairs with residual <= " << tau_keep << std::endl;
 
@@ -469,6 +470,7 @@ if (random_num >= interpolated_rho)
                 }
               if (outer == max_outer)
                 {
+                  //breaking if you reached the max amount of iterations
                   std::cout << "[RR] Reached max_outer=" << max_outer <<"\n";
                   break;
                 }
@@ -512,6 +514,7 @@ if (random_num >= interpolated_rho)
       std::cout << "[Progress] Total eigenvectors collected: " << mc_count << " / " << MC_TARGET << "\n";
     }
 
+  //once the code has finished it print out some data about your run.
   std::cout << "----------------------------------" << std::endl;
   std::cout << "Adaptive window summary:\n"
             << "  min_lower   = " << std::setprecision (17) << min_lower_use << "\n"
@@ -553,6 +556,7 @@ if (random_num >= interpolated_rho)
 
 //functions declared below
 
+
 /* -----------------------------------------------------------------------------
  * Lanczos-based spectral bounds via small tridiagonal diagonalization.
  * Given a Hermitian A, produce upper and lower bounds on lambda_min and
@@ -576,7 +580,6 @@ lanczos_bounds (std::shared_ptr<gko::matrix::Csr<real_precision> > A, int k_max,
   // initial random vector and normalize
   auto v_h = vec::create (host_exec, gko::dim<2>{ n, 1 });
   {
-    // tjc This is not a random vector since the same seed is being used every time
     std::mt19937 gen (42);
     std::normal_distribution<double> N01 (0.0, 1.0);
     for (gko::size_type i = 0; i < n; ++i)
