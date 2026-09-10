@@ -79,8 +79,6 @@ This repository is intended to be material for paper :  . If you find this prior
   **Compile**: "make" in terminal which uses Makefile
  
   **Run**: ./ matrixname.mtx <gpu_id> <NP> <NT> <max_outer> <target_frac> <mc_target> <ns_max>
-  
-  **Example**: ./execname matrix_out.txt 0 100 300 8 0.3 1000 600
  
   **matrix.mtx**: sparse matrix, MatrixMarket text format.
   
